@@ -3,6 +3,7 @@
 #include <v8.h>
 #include <stdint.h>
 #include <sstream>
+#include <iostream>
 
 extern "C" {
     #include "bcrypt.h"
@@ -37,6 +38,7 @@ extern "C" {
 
 #include "boolberry.h"
 #include "nrghash.h"
+#include "ActiveDAG.h"
 #include "block.h"
 
 using namespace node;
@@ -95,8 +97,9 @@ Handle<Value> x11(const Arguments& args) {
 Handle<Value> nrghash(const Arguments& args) {
     HandleScope scope;
 
+    using namespace n_nrghash;
     if (args.Length() < 9) {
-        return except("You must provide three argument");
+        return except("You must provide ten argument");
     }
 
     Local<Object> target = args[0]->ToObject();
@@ -115,10 +118,77 @@ Handle<Value> nrghash(const Arguments& args) {
 
     CBlockHeaderTruncatedLE truncatedBlockHeader(header);
     n_nrghash::h256_t headerHash(&truncatedBlockHeader, sizeof(truncatedBlockHeader));
-    n_nrghash::result_t ret = n_nrghash::light::hash(n_nrghash::cache_t(header.nHeight), headerHash, header.nNonce);
+
+    n_nrghash::result_t ret;
+    const auto& dag = ActiveDAG();
+    if (dag && (header.nHeight / constants::EPOCH_LENGTH == dag->epoch())) {
+        ret = n_nrghash::full::hash(*dag, headerHash, header.nNonce);
+        if (header.nHeight + 1 / constants::EPOCH_LENGTH > dag->epoch()) {
+            if (!LoadDAG(header.nHeight + 1)) {
+                CreateDAG(header.nHeight + 1);
+            }
+        } else if ((header.nHeight + nextDagGenerationDistance) / constants::EPOCH_LENGTH > dag->epoch()) {
+            CreateDAG(header.nHeight + nextDagGenerationDistance);
+        }
+    } else {
+        ret = n_nrghash::light::hash(n_nrghash::cache_t(header.nHeight), headerHash, header.nNonce);
+    }
 
     Buffer* buff = Buffer::New((char*)uint256(ret.value).begin(), 32);
     return scope.Close(buff->handle_);
+}
+
+Handle<Value> loadDAG(const Arguments& args) {
+    HandleScope scope;
+
+    if (args.Length() < 1) {
+        return except("You must provide one arguments");
+    }
+
+    uint64_t height = args[0]->Int32Value();
+    LoadNrgHashDAG(height, [](::std::size_t step, ::std::size_t max, int phase) -> bool {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(2)
+           << static_cast<double>(step) / static_cast<double>(max) * 100.0 << "%"
+           << std::setfill(' ') << std::setw(80);
+
+        auto progress_handler = [&](std::string const &msg) {
+            std::cout << "\r" << msg;
+        };
+
+        switch(phase) {
+        case n_nrghash::cache_seeding:
+            progress_handler("Seeding cache ... ");
+            break;
+        case n_nrghash::cache_generation:
+            progress_handler("Generating cache ... ");
+            break;
+        case n_nrghash::cache_saving:
+            progress_handler("Saving cache ... ");
+            break;
+        case n_nrghash::cache_loading:
+            progress_handler("Loading cache ... ");
+            break;
+        case n_nrghash::dag_generation:
+            progress_handler("Generating Dag ... ");
+            break;
+        case n_nrghash::dag_saving:
+            progress_handler("Saving Dag ... ");
+            break;
+        case n_nrghash::dag_loading:
+            progress_handler("Loading Dag ... ");
+            break;
+        case n_nrghash::dag_generateAndSave:
+            progress_handler("Generating and Saving Dag ... ");
+            break;
+        default:
+            break;
+        }
+        auto progress = ss.str();
+        std::cout << progress << std::flush;
+        return true;
+    });
+    return Handle<Value>();
 }
 
 Handle<Value> blockhash(const Arguments& args) {
@@ -144,7 +214,6 @@ Handle<Value> blockhash(const Arguments& args) {
 
     CBlockHeaderFullLE fullBlockHeader(header);
     n_nrghash::h256_t blockHash(&fullBlockHeader, sizeof(fullBlockHeader));
-    uint256  res = uint256(blockHash);
     Buffer* buff = Buffer::New((char*)uint256(blockHash).begin(), 32);
     return scope.Close(buff->handle_);
 }
@@ -848,6 +917,7 @@ void init(Handle<Object> exports) {
     exports->Set(String::NewSymbol("c11"), FunctionTemplate::New(c11)->GetFunction());
     exports->Set(String::NewSymbol("nrghash"), FunctionTemplate::New(nrghash)->GetFunction());
     exports->Set(String::NewSymbol("blockhash"), FunctionTemplate::New(blockhash)->GetFunction());
+    exports->Set(String::NewSymbol("loadDAG"), FunctionTemplate::New(loadDAG)->GetFunction());
 }
 
 NODE_MODULE(multihashing, init)

@@ -20,7 +20,20 @@ extern "C"
 #include <mutex>
 #include <string>
 #include <sstream>
-#include <iostream> // TODO: remove me (debugging)
+#include <iostream> // used by test
+
+//#define ENABLE_EGIHASH_DEBUG
+
+#ifdef ENABLE_EGIHASH_DEBUG
+//#   include <iostream>
+    static void egihash_dump_state();
+#   define EGIHASH_DEBUG(x) \
+        std::cout << "EGIHASH DEBUG: " << x << std::endl; \
+        egihash_dump_state(); \
+        std::cout << std::endl;
+#else
+#   define EGIHASH_DEBUG(x)
+#endif
 
 namespace
 {
@@ -100,24 +113,6 @@ namespace
 
 	static_assert(dag_file_header_t::magic_size == 12, "Magic size invalid.");
 	static_assert(sizeof(dag_file_header_t) == 64, "Dag header size invalid.");
-
-	inline uint32_t decode_int(uint8_t const * data, uint8_t const * dataEnd) noexcept
-	{
-		if (!data || (dataEnd < (data + 3)))
-			return 0;
-
-		return static_cast<uint32_t>(
-			(static_cast<uint32_t>(data[3]) << 24) |
-			(static_cast<uint32_t>(data[2]) << 16) |
-			(static_cast<uint32_t>(data[1]) << 8) |
-			(static_cast<uint32_t>(data[0]))
-		);
-	}
-
-	inline ::std::string zpad(::std::string const & str, size_t const length)
-	{
-		return str + ::std::string(::std::max(length - str.length(), static_cast<::std::string::size_type>(0)), 0);
-	}
 
 	template <typename IntegralType >
 	typename ::std::enable_if<::std::is_integral<IntegralType>::value, ::std::string>::type
@@ -205,7 +200,7 @@ namespace
 			}
 		}
 
- 		inline deserialized_hash_t deserialize() const
+		inline deserialized_hash_t deserialize() const
 		{
 			return data;
 		}
@@ -469,7 +464,7 @@ namespace n_nrghash
 				}
 			}
 
-			//std::cout << "Length: " << data.size() << std::endl;
+			EGIHASH_DEBUG("mkcache data length: " << data.size())
 
 			uint32_t progress_counter = 0;
 			for (uint32_t i = 0; i < constants::CACHE_ROUNDS; i++)
@@ -519,6 +514,9 @@ namespace n_nrghash
 			{
 				cache_size -= (2 * HASH_BYTES);
 			}
+
+			EGIHASH_DEBUG("block " << block_number << " cache size " << cache_size)
+
 			return cache_size;
 		}
 
@@ -561,7 +559,41 @@ namespace n_nrghash
 
 	void cache_t::unload() const
 	{
+		EGIHASH_DEBUG("unloading cache epoch " << epoch())
 		get_cache_cache().erase(epoch());
+	}
+
+	/**
+	 * Erase all dangling cache entries except for the last N epochs
+	 */
+	void cleanup_cache_cache()
+	{
+		using namespace std;
+		lock_guard<recursive_mutex> lock(get_cache_cache_mutex());
+
+		auto &cache = get_cache_cache();
+		vector<uint64_t> candidates;
+
+		for (const auto &v: cache) {
+			if (v.second.use_count() <= 1) {
+				candidates.push_back(v.first);
+			}
+		}
+
+		constexpr auto EPOCHS_TO_KEEP = 3;
+
+		if ( candidates.size() <= EPOCHS_TO_KEEP) {
+			return;
+		}
+
+		sort(begin(candidates), end(candidates));
+		candidates.resize(candidates.size() - EPOCHS_TO_KEEP);
+
+		EGIHASH_DEBUG("Erasing " << candidates.size() << " dangling caches")
+
+		for ( auto c : candidates ) {
+			cache.erase( c );
+		}
 	}
 
 	::std::shared_ptr<cache_t::impl_t> get_cache_from_cache(uint64_t const block_number, progress_callback_type callback)
@@ -575,9 +607,12 @@ namespace n_nrghash
 			auto const cache_cache_iterator = get_cache_cache().find(epoch_number);
 			if (cache_cache_iterator != get_cache_cache().end())
 			{
+				//EGIHASH_DEBUG("cache re-use for epoch " << epoch_number << " block " << block_number)
 				return cache_cache_iterator->second;
 			}
 		}
+
+		EGIHASH_DEBUG("generating cache for epoch " << epoch_number << " block " << block_number)
 
 		// otherwise create the cache and add it to the cache cache
 		// this is not locked as it can be a lengthy process and we don't want to block access to the cache cache
@@ -589,6 +624,8 @@ namespace n_nrghash
 		// if insert succeded, return the cache
 		if (insert_pair.second)
 		{
+			EGIHASH_DEBUG("inserted cache size " << impl->size)
+			cleanup_cache_cache();
 			return insert_pair.first->second;
 		}
 
@@ -677,13 +714,13 @@ namespace n_nrghash
 		using dag_cache_map = ::std::map<uint64_t /* epoch */, ::std::shared_ptr<impl_t>>;
 		static constexpr uint64_t max_epoch = ::std::numeric_limits<uint64_t>::max();
 
-		impl_t(uint64_t block_number, progress_callback_type callback)
+        impl_t(uint64_t block_number, progress_callback_type callback)
 		: epoch(block_number / constants::EPOCH_LENGTH)
 		, size(get_full_size(block_number))
 		, cache(block_number, callback)
 		, data()
 		{
-			generate(callback);
+            generate(callback);
 		}
 
 		impl_t(read_function_type read, dag_file_header_t & header, progress_callback_type callback)
@@ -706,6 +743,76 @@ namespace n_nrghash
 				}
 			}
 		}
+
+        static void generateAndSave(uint64_t block_number, std::string const& file_path, progress_callback_type callback)
+        {
+            using namespace std;
+            ofstream fs;
+            fs.open(file_path, ios::out | ios::binary);
+
+            size_type size = get_full_size(block_number);
+
+            cache_t cache(block_number, callback);
+            uint64_t cache_begin = constants::DAG_FILE_HEADER_SIZE + 1;
+            uint64_t cache_end = cache_begin + cache.size();
+            uint64_t dag_begin = cache_end;
+            uint64_t dag_end = dag_begin + size;
+
+            auto write = [&fs](void const * data, size_type count)
+            {
+                // TODO: write all value in little endian
+                fs.write(reinterpret_cast<char const *>(data), count);
+                if (fs.fail())
+                {
+                    throw hash_exception("Write failure");
+                }
+            };
+
+            uint64_t epoch = block_number / constants::EPOCH_LENGTH;
+
+            write(constants::DAG_MAGIC_BYTES, sizeof(constants::DAG_MAGIC_BYTES));
+            write(&constants::MAJOR_VERSION, sizeof(constants::MAJOR_VERSION));
+            write(&constants::REVISION, sizeof(constants::REVISION));
+            write(&constants::MINOR_VERSION, sizeof(constants::MINOR_VERSION));
+            write(&epoch, sizeof(epoch));
+            write(&cache_begin, sizeof(cache_begin));
+            write(&cache_end, sizeof(cache_end));
+            write(&dag_begin, sizeof(dag_begin));
+            write(&dag_end, sizeof(dag_end));
+
+
+            size_t max_count = cache.size() + size;
+            size_t count = 0;
+            for (auto const & i : cache.data())
+            {
+                for (auto const & j : i)
+                {
+                    write(&j, sizeof(j));
+                }
+                if (((++count % constants::CALLBACK_FREQUENCY) == 0) && !callback(count, max_count, dag_generateAndSave))
+                {
+                    throw hash_exception("DAG generate and save is cancelled.");
+                }
+            }
+
+            uint32_t const n = size / constants::HASH_BYTES;
+            for (uint32_t i = 0; i < n; i++)
+            {
+                data_type::value_type value = calc_dataset_item(cache.data(), i);
+                {
+                    for (auto const & j : value)
+                    {
+                        write(&j, sizeof(j));
+                    }
+                }
+                if ((i % constants::CALLBACK_FREQUENCY) == 0 && !callback(i, n, dag_generateAndSave))
+                {
+                    throw hash_exception("DAG generation and saving cancelled.");
+                }
+            }
+            fs.flush();
+            fs.close();
+        }
 
 		void save(::std::string const & file_path, progress_callback_type callback) const
 		{
@@ -738,7 +845,7 @@ namespace n_nrghash
 			write(&dag_begin, sizeof(dag_begin));
 			write(&dag_end, sizeof(dag_end));
 
-			size_t max_count = cache.size() + data.size();
+			size_t max_count = cache.data().size() + data.size();
 			size_t count = 0;
 			for (auto const & i : cache.data())
 			{
@@ -774,6 +881,7 @@ namespace n_nrghash
 				data.push_back(calc_dataset_item(cache.data(), i));
 				if ((i % constants::CALLBACK_FREQUENCY) == 0 && !callback(i, n, dag_generation))
 				{
+
 					throw hash_exception("DAG creation cancelled.");
 				}
 			}
@@ -798,7 +906,7 @@ namespace n_nrghash
 				}
 
 			}
-			return sha3_512(mix);
+            return sha3_512(mix);
 		}
 
 		cache_t get_cache() const
@@ -843,7 +951,7 @@ namespace n_nrghash
 	// ensures single threaded construction
 	dag_t::impl_t::dag_cache_map & dag_cache = get_dag_cache();
 
-	::std::shared_ptr<dag_t::impl_t> get_dag(uint64_t block_number, progress_callback_type callback)
+    ::std::shared_ptr<dag_t::impl_t> get_dag(uint64_t block_number, progress_callback_type callback)
 	{
 		using namespace std;
 		uint64_t epoch_number = block_number / constants::EPOCH_LENGTH;
@@ -858,24 +966,31 @@ namespace n_nrghash
 			}
 		}
 
+		EGIHASH_DEBUG("generating DAG for epoch " << epoch_number << " block " << block_number)
+
 		// otherwise create the dag and add it to the cache
 		// this is not locked as it can be a lengthy process and we don't want to block access to the dag cache
-		shared_ptr<dag_t::impl_t> impl(new dag_t::impl_t(block_number, callback));
+        shared_ptr<dag_t::impl_t> impl(new dag_t::impl_t(block_number, callback));
 
 		lock_guard<recursive_mutex> lock(get_dag_cache_mutex());
-		auto insert_pair = get_dag_cache().insert(make_pair(epoch_number, impl));
+        auto insert_pair = get_dag_cache().insert(make_pair(epoch_number, impl));
+        // if insert succeded, return the dag
+        if (insert_pair.second)
+        {
+            return insert_pair.first->second;
+        }
+        // if insert failed, it's probably already been inserted
+        auto const dag_cache_iterator = get_dag_cache().find(epoch_number);
+        if (dag_cache_iterator != get_dag_cache().end())
+        {
+            return dag_cache_iterator->second;
+        }
 
 		// if insert succeded, return the dag
 		if (insert_pair.second)
 		{
+			EGIHASH_DEBUG("inserted new DAG size " << impl->size << std::endl )
 			return insert_pair.first->second;
-		}
-
-		// if insert failed, it's probably already been inserted
-		auto const dag_cache_iterator = get_dag_cache().find(epoch_number);
-		if (dag_cache_iterator != get_dag_cache().end())
-		{
-			return dag_cache_iterator->second;
 		}
 
 		// we couldn't insert it and it's not in the cache
@@ -934,7 +1049,8 @@ namespace n_nrghash
 			// need to consume part of the buffer and then read more
 			if (count > static_cast<size_type>(buffer_ptr_end - buffer_ptr))
 			{
-				//::std::cout << ::std::endl << "hit boundary, asked for " << count << " bytes but " << buffer_ptr_end - buffer_ptr << " remaining in buffer." << ::std::endl;
+				EGIHASH_DEBUG("hit boundary, asked for " << count <<
+					" bytes but " << buffer_ptr_end - buffer_ptr << " remaining in buffer.")
 				::std::memcpy(dst, buffer_ptr, buffer_ptr_end - buffer_ptr);
 				count -= (buffer_ptr_end - buffer_ptr);
 				dst = reinterpret_cast<char*>(dst) + (buffer_ptr_end - buffer_ptr);
@@ -969,6 +1085,8 @@ namespace n_nrghash
 			}
 		}
 
+		EGIHASH_DEBUG("loading DAG from " << file_path)
+
 		// otherwise create the dag and add it to the cache
 		// this is not locked as it can be a lengthy process and we don't want to block access to the dag cache
 		shared_ptr<dag_t::impl_t> impl(new dag_t::impl_t(read, header, callback));
@@ -979,6 +1097,8 @@ namespace n_nrghash
 		// if insert succeded, return the dag
 		if (insert_pair.second)
 		{
+			EGIHASH_DEBUG("inserted new DAG: " << impl->epoch
+				<< " size " << impl->size );
 			return insert_pair.first->second;
 		}
 
@@ -993,13 +1113,13 @@ namespace n_nrghash
 		throw hash_exception("Could not get DAG");
 	}
 
-	dag_t::dag_t(uint64_t block_number, progress_callback_type callback)
-	: impl(get_dag(block_number, callback))
+    dag_t::dag_t(uint64_t block_number, progress_callback_type callback)
+    : impl(get_dag(block_number, callback))
 	{
 	}
 
 	dag_t::dag_t(::std::string const & file_path, progress_callback_type callback)
-	: impl(get_dag(file_path, callback))
+    : impl(get_dag(file_path, callback))
 	{
 
 	}
@@ -1019,10 +1139,15 @@ namespace n_nrghash
 		return impl->data;
 	}
 
-	void dag_t::save(::std::string const & file_path, progress_callback_type callback) const
+    void dag_t::save(::std::string const & file_path, progress_callback_type callback) const
 	{
 		impl->save(file_path, callback);
 	}
+
+    void dag_t::generateAndSave(uint64_t block_number, ::std::string const & file_path, progress_callback_type callback)
+    {
+        impl_t::generateAndSave(block_number, file_path, callback);
+    }
 
 	cache_t dag_t::get_cache() const
 	{
@@ -1031,11 +1156,17 @@ namespace n_nrghash
 
 	void dag_t::unload() const
 	{
+		EGIHASH_DEBUG("unloading DAG epoch" << impl->epoch
+			<< " size " << impl->size );
+
 		auto const i = get_dag_cache().erase(epoch());
 		if (i == 0)
 		{
 			throw hash_exception("Can not unload DAG - not loaded.");
 		}
+		get_cache().unload();
+
+		EGIHASH_DEBUG("unloaded DAG");
 	}
 
 	dag_t::size_type dag_t::get_full_size(uint64_t const block_number) noexcept
@@ -1064,6 +1195,31 @@ namespace n_nrghash
 		}
 		return loaded_epochs;
 	}
+
+    bool dag_t::is_dag_file_corrupted(std::string dag_file)
+    {
+        using namespace std;
+        //using size_type = dag_t::size_type;
+
+        ifstream fs;
+        fs.open(dag_file, ios::in | ios::binary);
+
+        if (fs.fail())
+        {
+            return true;
+        }
+
+        fs.seekg(0, ios::end);
+        dag_t::size_type const filesize = static_cast<dag_t::size_type>(fs.tellg());
+        fs.seekg(0, ios::beg);
+
+        // check minimum dag size
+        if (filesize < constants::DAG_FILE_MINIMUM_SIZE)
+        {
+            return true;
+        }
+        return false;
+    }
 
 // TODO: reference code, remove me
 #if 0
@@ -1325,6 +1481,9 @@ namespace n_nrghash
 				case dag_loading:
 					cout << "\rLoading DAG...";
 					break;
+                case dag_generateAndSave:
+                    cout << "\rGenerating and Saving DAG...";
+                    break;
 				default:
 					break;
 			}
@@ -1335,15 +1494,15 @@ namespace n_nrghash
 			return true;
 		};
 
-//		try
+		try
 		{
 			dag_t loaded("epoch0_generated.dag", progress);
 			cout << endl << "\runloading DAG: " << endl;
 			loaded.unload();
 		}
-//		catch (hash_exception const & e)
+		catch (hash_exception const & e)
 		{
-//			cout << endl << "[Exception]: (don't worry about this if you don't have epoch0_generated.dag): " << e.what() << endl;
+			cout << endl << "[Exception]: (don't worry about this if you don't have epoch0_generated.dag): " << e.what() << endl;
 		}
 
 		{
@@ -1377,21 +1536,28 @@ namespace n_nrghash
 	{
 		using namespace std;
 		bool result = false;
-	//	try
+		try
 		{
 			result = test_function_();
 		}
-	//	catch (::std::exception const & e)
+		catch (::std::exception const & e)
 		{
-	//		cerr << "[ERROR]: Caught exception: " << e.what() << endl;
-	//		result = false;
+			cerr << "[ERROR]: Caught exception: " << e.what() << endl;
+			result = false;
 		}
-	//	catch(...)
+		catch(...)
 		{
-	//		cerr << "[ERROR]: Unknown exception." << endl;
-	//		result = false;
+			cerr << "[ERROR]: Unknown exception." << endl;
+			result = false;
 		}
 
 		return result;
 	}
 }
+
+#ifdef ENABLE_EGIHASH_DEBUG
+	static void egihash_dump_state() {
+		std::cout << "Cache Cache Size: " << egihash::get_cache_cache().size() << std::endl;
+		std::cout << "DAG Cache Size: " << egihash::get_dag_cache().size() << std::endl;
+	}
+#endif
